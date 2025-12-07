@@ -1,0 +1,150 @@
+WITH
+account_ses AS (
+-- 1) CTE for the unique account table by first session date
+SELECT
+s.date,
+sp.country,
+acc.id AS account_id,
+acc.send_interval,
+acc.is_verified,
+acc.is_unsubscribed
+FROM `data-analytics-mate.DA.account_session` AS acs
+JOIN `data-analytics-mate.DA.account` AS acc
+ON acs.account_id = acc.id
+JOIN `data-analytics-mate.DA.session_params` AS sp
+ON acs.ga_session_id = sp.ga_session_id
+JOIN `data-analytics-mate.DA.session` AS s
+ON acs.ga_session_id = s.ga_session_id
+WHERE sp.country IS NOT NULL AND sp.country != "(not set)"
+GROUP BY 1,2,3,4,5,6
+),
+
+sm_date AS (
+-- 2) Send date and Sent / Open / Visit message data
+SELECT
+DATE_ADD(s.date, INTERVAL es.sent_date DAY) AS date,
+sp.country,
+es.id_account AS account_id,
+COUNT(DISTINCT es.id_message) AS sent_msg,
+COUNT(DISTINCT eo.id_message) AS open_msg,
+COUNT(DISTINCT ev.id_message) AS visit_msg
+FROM `data-analytics-mate.DA.session` AS s
+JOIN `data-analytics-mate.DA.account_session` AS acs
+ON s.ga_session_id = acs.ga_session_id
+JOIN `data-analytics-mate.DA.session_params` AS sp
+ON s.ga_session_id = sp.ga_session_id
+JOIN `data-analytics-mate.DA.email_sent` AS es
+ON acs.account_id = es.id_account
+LEFT JOIN `data-analytics-mate.DA.email_open` AS eo
+ON es.id_message = eo.id_message
+LEFT JOIN `data-analytics-mate.DA.email_visit` AS ev
+ON es.id_message = ev.id_message
+GROUP BY 1,2,3
+),
+
+data_ses AS (
+-- 3) CTE for unique account table by date
+SELECT
+date,
+sp.country,
+acc.send_interval,
+acc.is_verified,
+acc.is_unsubscribed,
+acs.account_id,
+FROM `data-analytics-mate.DA.account_session` AS acs
+JOIN `sm_date`
+ON acs.account_id = sm_date.account_id
+JOIN `data-analytics-mate.DA.account` AS acc
+ON acs.account_id = acc.id
+JOIN `data-analytics-mate.DA.session_params` AS sp
+ON acs.ga_session_id = sp.ga_session_id
+WHERE sp.country IS NOT NULL AND sp.country != "(not set)"
+GROUP BY 1,2,3,4,5,6
+),
+
+union_data AS (
+-- 4) Union of both datasets
+SELECT
+date,
+country,
+send_interval,
+is_verified,
+is_unsubscribed,
+account_id
+FROM `account_ses`
+UNION ALL
+SELECT
+date,
+country,
+send_interval,
+is_verified,
+is_unsubscribed,
+account_id
+FROM `data_ses`
+),
+
+osv_data AS (
+-- 5) Join with send/open/visit message data
+SELECT
+union_data.date,
+union_data.country,
+union_data.send_interval,
+union_data.is_verified,
+union_data.is_unsubscribed,
+union_data.account_id,
+sm_date.sent_msg,
+sm_date.open_msg,
+sm_date.visit_msg
+FROM `union_data`
+LEFT JOIN `sm_date`
+ON union_data.account_id = sm_date.account_id
+AND union_data.date = sm_date.date
+AND union_data.country = sm_date.country
+GROUP BY 1,2,3,4,5,6,7,8,9
+),
+
+agg_data AS (
+-- 6) Aggregate by date and country
+SELECT
+date,
+country,
+(send_interval) AS send_interval,
+(is_verified) AS is_verified,
+(is_unsubscribed) AS is_unsubscribed,
+COUNT(DISTINCT account_id) AS account_cnt,
+SUM(COALESCE(sent_msg, 0)) AS sent_msg,
+SUM(COALESCE(open_msg, 0)) AS open_msg,
+SUM(COALESCE(visit_msg, 0)) AS visit_msg
+FROM `osv_data`
+GROUP BY 1,2,3,4,5
+),
+
+country_totals AS (
+-- 7) Compute total counts per country (across all dates)
+SELECT
+date,
+country,
+SUM(account_cnt) AS total_country_account_cnt,
+SUM(sent_msg) AS total_country_sent_cnt
+FROM `agg_data`
+GROUP BY 1,2
+),
+
+final_with_totals AS (
+-- 8) Join totals back to the main aggregation
+SELECT
+agg_data.*,
+country_totals.total_country_account_cnt,
+country_totals.total_country_sent_cnt,
+DENSE_RANK() OVER (ORDER BY country_totals.total_country_account_cnt DESC) AS rank_total_country_account_cnt,
+DENSE_RANK() OVER (ORDER BY country_totals.total_country_sent_cnt DESC) AS rank_total_country_sent_cnt
+FROM agg_data
+LEFT JOIN country_totals ON agg_data.date = country_totals.date AND agg_data.country = country_totals.country
+GROUP BY date, country, send_interval, is_verified, is_unsubscribed, account_cnt, sent_msg, open_msg, visit_msg, total_country_account_cnt, total_country_sent_cnt
+)
+
+-- FINAL OUTPUT
+SELECT *
+FROM `final_with_totals`
+WHERE rank_total_country_account_cnt <= 10 OR rank_total_country_sent_cnt <= 10
+ORDER BY date, country
